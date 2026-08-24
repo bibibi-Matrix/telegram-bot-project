@@ -43,4 +43,5 @@ jobs:
           cache-to: type=gha,mode=max
           tags: |
             ${{ steps.meta.outputs.image }}:latest
+            ${{ steps.meta.outputs.image }}:v1
             ${{ steps.meta.outputs.image }}:${{ github.sha }}
