@@ -441,8 +441,8 @@ class Bot:
             await self.mt.add_firewall_nat_rule(
                 comment=_WG_ALL_NAT_COMMENT,
                 chain="srcnat",
-                src_address_list=_WG_SUBNETS_LIST,
                 action="masquerade",
+                **{"src-address-list": _WG_SUBNETS_LIST},
             )
 
     async def _ensure_lan_member(self, iface: str) -> None:
@@ -501,8 +501,8 @@ class Bot:
                 place_before=input_anchor,
                 chain="input",
                 protocol="udp",
-                dst_port=str(listen_port),
                 action="accept",
+                **{"dst-port": str(listen_port)},
             )
         else:
             cur = next((x for x in existing if x.get("comment") == handshake_comment), None)
@@ -538,8 +538,8 @@ class Bot:
                 place_before=input_anchor,
                 chain="input",
                 protocol="udp",
-                dst_port=str(listen_port),
                 action="accept",
+                **{"dst-port": str(listen_port)},
             )
 
     def _next_peer_ip(self, subnet: str, used: set[str]) -> str | None:
@@ -1971,8 +1971,8 @@ class Bot:
                             await self.mt.add_firewall_nat_rule(
                                 comment=f"wg-{name}-nat",
                                 chain="srcnat",
-                                out_interface=name,
                                 action="masquerade",
+                                **{"out-interface": name},
                             )
                             report.append(f"✅ {name} — NAT masquerade создан")
                         except RouterOSError as exc:
