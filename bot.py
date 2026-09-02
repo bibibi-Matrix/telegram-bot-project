@@ -346,10 +346,10 @@ class Bot:
                 },
             )
         else:
-            # Ensure it stays at the top of the forward chain.
-            await self.mt.update_firewall_rule(
-                isolate[".id"], **{"place-before": "0"}
-            )
+            # Rule already exists. RouterOS REST does not support moving a rule
+            # via PATCH (place-before is only accepted on create), so its
+            # position must be ensured manually if needed.
+            logger.debug("wg-isolate already present, position not moved")
         wanted = {u["subnet"] for u in self.db.list_users() if u.get("subnet")}
         entries = await self.mt.get_address_list_entries(_WG_SUBNETS_LIST)
         have = {e.get("address") for e in entries}
