@@ -167,6 +167,17 @@ _WG_ISOLATE_COMMENT = "wg-isolate"
 _WG_SUBNETS_LIST = "wg-subnets"
 _WG_SUBNETS_COMMENT = "wg-bot"
 
+# Consolidated rules (manually set up on the router): when present, the bot
+# does NOT create per-user forward/return/nat rules since they are already
+# covered by an interface-list / address-list based rule.
+_WG_ALL_FORWARD_COMMENT = "wg-all-forward"
+_WG_ALL_RETURN_COMMENT = "wg-all-return"
+_WG_ALL_NAT_COMMENT = "wg-all-nat"
+
+# Interface list that receives every WireGuard tunnel so a consolidated
+# forward rule (wg-all-forward / wg-all-return) sees them automatically.
+WG_LAN_INTERFACE_LIST = "LAN"
+
 _SYNC_SECTION = "sync"
 
 _MAX_BROADCAST_LEN = 4000
@@ -341,6 +352,72 @@ class Bot:
             if entry.get("address") == subnet:
                 await self.mt.remove_address_list_entry(entry[".id"])
 
+    @staticmethod
+    def _has_consolidated_forward(rules: list[dict], comment_suffix: str) -> bool:
+        """True if a consolidated forward/return rule already covers all WG.
+
+        Detects both the explicit wg-all-* comment and any forward rule that
+        matches by interface list (in/out-interface-list non-empty).
+        """
+        for r in rules:
+            if r.get("chain") != "forward":
+                continue
+            if r.get("comment") == comment_suffix:
+                return True
+            if r.get("action") != "accept":
+                continue
+            if r.get("in-interface-list") or r.get("out-interface-list"):
+                return True
+        return False
+
+    @staticmethod
+    def _has_consolidated_nat(nat_rules: list[dict]) -> bool:
+        """True if a consolidated srcnat rule already masses all WG subnets."""
+        for r in nat_rules:
+            if r.get("chain") != "srcnat":
+                continue
+            if r.get("action") != "masquerade":
+                continue
+            if r.get("comment") == _WG_ALL_NAT_COMMENT:
+                return True
+            if r.get("src-address-list") == _WG_SUBNETS_LIST:
+                return True
+        return False
+
+    async def _ensure_lan_member(self, iface: str) -> None:
+        """Add a WireGuard tunnel to the LAN interface list if not already there.
+
+        The consolidated forward rules match in/out-interface-list=LAN, so every
+        managed WG tunnel must be a member of that list for traffic to flow.
+        """
+        try:
+            members = await self.mt.get_interface_list_members(WG_LAN_INTERFACE_LIST)
+        except RouterOSError as exc:
+            logger.warning("Cannot read interface list %s: %s", WG_LAN_INTERFACE_LIST, exc)
+            return
+        for m in members:
+            if m.get("interface") == iface:
+                return
+        try:
+            await self.mt.add_interface_to_list(iface, WG_LAN_INTERFACE_LIST, comment="wg-bot")
+            logger.info("Added %s to interface list %s", iface, WG_LAN_INTERFACE_LIST)
+        except RouterOSError as exc:
+            logger.warning("Cannot add %s to interface list %s: %s", iface, WG_LAN_INTERFACE_LIST, exc)
+
+    async def _remove_lan_member(self, iface: str) -> None:
+        """Remove an interface from the LAN list (used when deleting a user)."""
+        try:
+            members = await self.mt.get_interface_list_members(WG_LAN_INTERFACE_LIST)
+        except RouterOSError:
+            return
+        for m in members:
+            if m.get("interface") == iface:
+                try:
+                    await self.mt.remove_interface_from_list(m[".id"])
+                except RouterOSError as exc:
+                    logger.warning("Cannot remove %s from %s: %s", iface, WG_LAN_INTERFACE_LIST, exc)
+                return
+
     async def _ensure_firewall(self, iface: str, listen_port: int, subnet: str) -> None:
         """Add missing firewall rules for the user's WireGuard interface.
 
@@ -349,10 +426,19 @@ class Bot:
         placed at the top of the forward chain blocks traffic between users.
         """
         await self._sync_wg_subnets()
+        await self._ensure_lan_member(iface)
         existing = await self.mt.get_firewall_rules()
         comments = {r.get("comment") for r in existing}
         input_anchor = self._chain_drop_anchor(existing, "input")
         forward_anchor = self._chain_drop_anchor(existing, "forward")
+
+        # If consolidated forward/return rules exist (via interface-list), do
+        # not create per-user forward/return rules — the tunnel just needs to be
+        # a member of the LAN interface list (handled above in _ensure_lan_member).
+        consolidated_forward = self._has_consolidated_forward(
+            existing, _WG_ALL_FORWARD_COMMENT
+        ) and self._has_consolidated_forward(existing, _WG_ALL_RETURN_COMMENT)
+
         wanted = [
             {
                 "comment": f"wg-{iface}-handshake",
@@ -370,23 +456,26 @@ class Bot:
                 "anchor": input_anchor,
                 "fields": {"in-interface": iface, "action": "accept"},
             },
-            {
-                "comment": f"wg-{iface}-forward",
-                "chain": "forward",
-                "anchor": forward_anchor,
-                "fields": {"in-interface": iface, "action": "accept"},
-            },
-            {
-                "comment": f"wg-{iface}-return",
-                "chain": "forward",
-                "anchor": forward_anchor,
-                "fields": {
-                    "out-interface": iface,
-                    "connection-state": "established,related",
-                    "action": "accept",
-                },
-            },
         ]
+        if not consolidated_forward:
+            wanted += [
+                {
+                    "comment": f"wg-{iface}-forward",
+                    "chain": "forward",
+                    "anchor": forward_anchor,
+                    "fields": {"in-interface": iface, "action": "accept"},
+                },
+                {
+                    "comment": f"wg-{iface}-return",
+                    "chain": "forward",
+                    "anchor": forward_anchor,
+                    "fields": {
+                        "out-interface": iface,
+                        "connection-state": "established,related",
+                        "action": "accept",
+                    },
+                },
+            ]
         for rule in wanted:
             if rule["comment"] in comments:
                 if rule["comment"].endswith("-handshake"):
@@ -408,15 +497,16 @@ class Bot:
 
         nat_existing = await self.mt.get_firewall_nat_rules()
         nat_comments = {r.get("comment") for r in nat_existing}
-        nat_rule = {
-            "comment": f"wg-{iface}-nat",
-            "chain": "srcnat",
-            "src-address": subnet,
-            "action": "masquerade",
-        }
-        if nat_rule["comment"] not in nat_comments:
-            fields = {k: v for k, v in nat_rule.items() if k != "comment"}
-            await self.mt.add_firewall_nat_rule(nat_rule["comment"], **fields)
+        if not self._has_consolidated_nat(nat_existing):
+            nat_rule = {
+                "comment": f"wg-{iface}-nat",
+                "chain": "srcnat",
+                "src-address": subnet,
+                "action": "masquerade",
+            }
+            if nat_rule["comment"] not in nat_comments:
+                fields = {k: v for k, v in nat_rule.items() if k != "comment"}
+                await self.mt.add_firewall_nat_rule(nat_rule["comment"], **fields)
 
     async def _reposition_user_rules(self, iface: str, listen_port: int) -> None:
         """Delete and recreate a user's firewall rules in the canonical position.
@@ -432,6 +522,10 @@ class Bot:
         for r in rules:
             if (r.get("comment") or "").startswith(f"wg-{iface}-"):
                 await self.mt.delete_firewall_rule(r[".id"])
+        await self._ensure_lan_member(iface)
+        consolidated_forward = self._has_consolidated_forward(
+            rules, _WG_ALL_FORWARD_COMMENT
+        ) and self._has_consolidated_forward(rules, _WG_ALL_RETURN_COMMENT)
         wanted = [
             {
                 "comment": f"wg-{iface}-input",
@@ -449,23 +543,26 @@ class Bot:
                     "action": "accept",
                 },
             },
-            {
-                "comment": f"wg-{iface}-return",
-                "chain": "forward",
-                "anchor": forward_anchor,
-                "fields": {
-                    "out-interface": iface,
-                    "connection-state": "established,related",
-                    "action": "accept",
-                },
-            },
-            {
-                "comment": f"wg-{iface}-forward",
-                "chain": "forward",
-                "anchor": forward_anchor,
-                "fields": {"in-interface": iface, "action": "accept"},
-            },
         ]
+        if not consolidated_forward:
+            wanted += [
+                {
+                    "comment": f"wg-{iface}-return",
+                    "chain": "forward",
+                    "anchor": forward_anchor,
+                    "fields": {
+                        "out-interface": iface,
+                        "connection-state": "established,related",
+                        "action": "accept",
+                    },
+                },
+                {
+                    "comment": f"wg-{iface}-forward",
+                    "chain": "forward",
+                    "anchor": forward_anchor,
+                    "fields": {"in-interface": iface, "action": "accept"},
+                },
+            ]
         for rule in wanted:
             await self.mt.add_firewall_rule(
                 rule["comment"],
@@ -1416,6 +1513,10 @@ class Bot:
                 await self.mt.delete_firewall_nat_rule(rule[".id"])
         if user.get("subnet"):
             await self._remove_wg_subnet(user["subnet"])
+        try:
+            await self._remove_lan_member(iface)
+        except RouterOSError as exc:
+            logger.warning("Cannot remove %s from LAN: %s", iface, exc)
         info = await self.mt.get_wireguard_interface(iface)
         if info:
             await self.mt.delete_wireguard_interface(info[".id"])
@@ -1646,7 +1747,11 @@ class Bot:
             nat_comment = f"wg-{name}-nat"
             nat_masq = any(
                 r.get("action") == "masquerade"
-                and (r.get("comment") == nat_comment or r.get("out-interface") == name)
+                and (
+                    r.get("comment") == nat_comment
+                    or r.get("out-interface") == name
+                    or (r.get("src-address-list") == _WG_SUBNETS_LIST)
+                )
                 for r in all_nat
             )
             result[name] = {
@@ -1862,6 +1967,7 @@ class Bot:
                     try:
                         await self.mt.create_wireguard_interface(name, ddata["listen_port"], self.cfg.WG_MTU)
                         report.append(f"✅ {name} — создан на роутере (порт {ddata['listen_port']})")
+                        await self._ensure_lan_member(name)
                     except RouterOSError as exc:
                         report.append(f"❌ {name} — ошибка создания: {exc}")
                         continue

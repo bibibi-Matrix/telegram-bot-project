@@ -223,6 +223,26 @@ class MikroTik:
     async def remove_address_list_entry(self, entry_id: str) -> None:
         await self._request("DELETE", f"ip/firewall/address-list/{entry_id}")
 
+    # ---------------------------------------------------------- interface lists
+    async def get_interface_lists(self) -> list[dict]:
+        return await self._request("GET", "interface/list")
+
+    async def get_interface_list_members(self, list_name: str | None = None) -> list[dict]:
+        path = "interface/list/member"
+        if list_name:
+            path = f"interface/list/member?list={list_name}"
+        return await self._request("GET", path)
+
+    async def add_interface_to_list(self, interface: str, list_name: str, comment: str = "") -> dict:
+        """Add an interface to an interface list (e.g. put WG tunnels into LAN)."""
+        payload: dict[str, Any] = {"interface": interface, "list": list_name}
+        if comment:
+            payload["comment"] = comment
+        return await self._request("PUT", "interface/list/member", payload)
+
+    async def remove_interface_from_list(self, member_id: str) -> None:
+        await self._request("DELETE", f"interface/list/member/{member_id}")
+
     # ------------------------------------------------------------------ system
     async def get_identity(self) -> str:
         data = await self._request("GET", "system/identity")
