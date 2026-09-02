@@ -3316,8 +3316,8 @@ def build_app(cfg: Config) -> tuple[Application, Bot]:
                 await asyncio.sleep(_DEADLINE_WARN_INTERVAL)
 
         background_tasks: set[asyncio.Task] = set()
-        t1 = asyncio.create_task(_expiry_loop())
-        t2 = asyncio.create_task(_deadline_warn_loop())
+        t1 = application.create_task(_expiry_loop())
+        t2 = application.create_task(_deadline_warn_loop())
         background_tasks.add(t1)
         background_tasks.add(t2)
         t1.add_done_callback(background_tasks.discard)
