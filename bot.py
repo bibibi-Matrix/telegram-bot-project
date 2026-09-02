@@ -170,6 +170,7 @@ _WG_SUBNETS_COMMENT = "wg-bot"
 # Consolidated rules (manually set up on the router): when present, the bot
 # does NOT create per-user forward/return/nat rules since they are already
 # covered by an interface-list / address-list based rule.
+_WG_ALL_INPUT_COMMENT = "wg-all-input"
 _WG_ALL_FORWARD_COMMENT = "wg-all-forward"
 _WG_ALL_RETURN_COMMENT = "wg-all-return"
 _WG_ALL_NAT_COMMENT = "wg-all-nat"
@@ -325,9 +326,15 @@ class Bot:
         return "0"
 
     async def _sync_wg_subnets(self) -> None:
-        """Ensure the cross-user isolation rule and the wg-subnets address list."""
+        """Ensure the cross-user isolation rule and the wg-subnets address list.
+
+        The isolate rule is placed at the very top of the forward chain so it
+        runs BEFORE the consolidated wg-all-forward/wg-all-return rules — this
+        is what actually blocks traffic between different WG subnets.
+        """
         rules = await self.mt.get_firewall_rules()
-        if not any(r.get("comment") == _WG_ISOLATE_COMMENT for r in rules):
+        isolate = next((r for r in rules if r.get("comment") == _WG_ISOLATE_COMMENT), None)
+        if not isolate:
             await self.mt.add_firewall_rule(
                 _WG_ISOLATE_COMMENT,
                 place_before="0",
@@ -337,6 +344,11 @@ class Bot:
                     "src-address-list": _WG_SUBNETS_LIST,
                     "dst-address-list": _WG_SUBNETS_LIST,
                 },
+            )
+        else:
+            # Ensure it stays at the top of the forward chain.
+            await self.mt.update_firewall_rule(
+                isolate[".id"], **{"place-before": "0"}
             )
         wanted = {u["subnet"] for u in self.db.list_users() if u.get("subnet")}
         entries = await self.mt.get_address_list_entries(_WG_SUBNETS_LIST)
@@ -353,36 +365,85 @@ class Bot:
                 await self.mt.remove_address_list_entry(entry[".id"])
 
     @staticmethod
-    def _has_consolidated_forward(rules: list[dict], comment_suffix: str) -> bool:
-        """True if a consolidated forward/return rule already covers all WG.
+    def _find_rule_by_comment(rules: list[dict], chain: str, comment: str) -> dict | None:
+        return next(
+            (r for r in rules if r.get("chain") == chain and r.get("comment") == comment),
+            None,
+        )
 
-        Detects both the explicit wg-all-* comment and any forward rule that
-        matches by interface list (in/out-interface-list non-empty).
+    @staticmethod
+    def _has_consolidated_filter(rules: list[dict], chain: str, comment: str) -> bool:
+        """True if a filter rule with the given chain/comment already exists.
+
+        Accepts any owner (created manually or by the bot) — bridge over to a
+        matching rule when the comment differs (e.g. an older name) but the
+        structure matches.
         """
-        for r in rules:
-            if r.get("chain") != "forward":
-                continue
-            if r.get("comment") == comment_suffix:
-                return True
-            if r.get("action") != "accept":
-                continue
-            if r.get("in-interface-list") or r.get("out-interface-list"):
-                return True
-        return False
+        return self._find_rule_by_comment(rules, chain, comment) is not None
 
     @staticmethod
     def _has_consolidated_nat(nat_rules: list[dict]) -> bool:
-        """True if a consolidated srcnat rule already masses all WG subnets."""
-        for r in nat_rules:
-            if r.get("chain") != "srcnat":
-                continue
-            if r.get("action") != "masquerade":
-                continue
-            if r.get("comment") == _WG_ALL_NAT_COMMENT:
-                return True
-            if r.get("src-address-list") == _WG_SUBNETS_LIST:
-                return True
-        return False
+        return any(
+            r.get("chain") == "srcnat"
+            and r.get("action") == "masquerade"
+            and (r.get("comment") == _WG_ALL_NAT_COMMENT or r.get("src-address-list") == _WG_SUBNETS_LIST)
+            for r in nat_rules
+        )
+
+    async def _ensure_consolidated_rules(self) -> None:
+        """Create the shared wg-all-* rules only if they are not present yet.
+
+        Consolidated scheme (single set of rules for every WG tunnel):
+          - wg-all-input   : input    accept in-interface-list=LAN
+          - wg-all-forward : forward  accept in-interface-list=LAN
+          - wg-all-return  : forward  accept out-interface-list=LAN
+                                              (connection-state=established,related)
+          - wg-all-nat     : srcnat   masquerade src-address-list=wg-subnets
+        The bot never duplicates these; manually created equivalents are left
+        untouched.
+        """
+        rules = await self.mt.get_firewall_rules()
+        input_anchor = self._chain_drop_anchor(rules, "input")
+        forward_anchor = self._chain_drop_anchor(rules, "forward")
+
+        if not self._has_consolidated_filter(rules, "input", _WG_ALL_INPUT_COMMENT):
+            await self.mt.add_firewall_rule(
+                _WG_ALL_INPUT_COMMENT,
+                place_before=input_anchor,
+                chain="input",
+                action="accept",
+                **{"in-interface-list": WG_LAN_INTERFACE_LIST},
+            )
+
+        if not self._has_consolidated_filter(rules, "forward", _WG_ALL_FORWARD_COMMENT):
+            await self.mt.add_firewall_rule(
+                _WG_ALL_FORWARD_COMMENT,
+                place_before=forward_anchor,
+                chain="forward",
+                action="accept",
+                **{"in-interface-list": WG_LAN_INTERFACE_LIST},
+            )
+
+        if not self._has_consolidated_filter(rules, "forward", _WG_ALL_RETURN_COMMENT):
+            await self.mt.add_firewall_rule(
+                _WG_ALL_RETURN_COMMENT,
+                place_before=forward_anchor,
+                chain="forward",
+                action="accept",
+                **{
+                    "out-interface-list": WG_LAN_INTERFACE_LIST,
+                    "connection-state": "established,related",
+                },
+            )
+
+        nat_existing = await self.mt.get_firewall_nat_rules()
+        if not self._has_consolidated_nat(nat_existing):
+            await self.mt.add_firewall_nat_rule(
+                comment=_WG_ALL_NAT_COMMENT,
+                chain="srcnat",
+                src_address_list=_WG_SUBNETS_LIST,
+                action="masquerade",
+            )
 
     async def _ensure_lan_member(self, iface: str) -> None:
         """Add a WireGuard tunnel to the LAN interface list if not already there.
@@ -419,156 +480,66 @@ class Bot:
                 return
 
     async def _ensure_firewall(self, iface: str, listen_port: int, subnet: str) -> None:
-        """Add missing firewall rules for the user's WireGuard interface.
+        """Ensure per-user and consolidated firewall rules for the user's WG.
 
-        Bot rules are inserted before the first drop rule of each chain so they
-        always stay above the final "drop all" policies. The wg-isolate rule
-        placed at the top of the forward chain blocks traffic between users.
+        Per-user only the handshake rule is created (unique UDP listen port per
+        tunnel). The shared wg-all-input / wg-all-forward / wg-all-return /
+        wg-all-nat rules and the wg-isolate rule are created once and reused by
+        every tunnel (via the LAN interface list / wg-subnets address list).
         """
+        await self._ensure_consolidated_rules()
         await self._sync_wg_subnets()
         await self._ensure_lan_member(iface)
         existing = await self.mt.get_firewall_rules()
         comments = {r.get("comment") for r in existing}
         input_anchor = self._chain_drop_anchor(existing, "input")
-        forward_anchor = self._chain_drop_anchor(existing, "forward")
 
-        # If consolidated forward/return rules exist (via interface-list), do
-        # not create per-user forward/return rules — the tunnel just needs to be
-        # a member of the LAN interface list (handled above in _ensure_lan_member).
-        consolidated_forward = self._has_consolidated_forward(
-            existing, _WG_ALL_FORWARD_COMMENT
-        ) and self._has_consolidated_forward(existing, _WG_ALL_RETURN_COMMENT)
-
-        wanted = [
-            {
-                "comment": f"wg-{iface}-handshake",
-                "chain": "input",
-                "anchor": input_anchor,
-                "fields": {
-                    "protocol": "udp",
-                    "dst-port": str(listen_port),
-                    "action": "accept",
-                },
-            },
-            {
-                "comment": f"wg-{iface}-input",
-                "chain": "input",
-                "anchor": input_anchor,
-                "fields": {"in-interface": iface, "action": "accept"},
-            },
-        ]
-        if not consolidated_forward:
-            wanted += [
-                {
-                    "comment": f"wg-{iface}-forward",
-                    "chain": "forward",
-                    "anchor": forward_anchor,
-                    "fields": {"in-interface": iface, "action": "accept"},
-                },
-                {
-                    "comment": f"wg-{iface}-return",
-                    "chain": "forward",
-                    "anchor": forward_anchor,
-                    "fields": {
-                        "out-interface": iface,
-                        "connection-state": "established,related",
-                        "action": "accept",
-                    },
-                },
-            ]
-        for rule in wanted:
-            if rule["comment"] in comments:
-                if rule["comment"].endswith("-handshake"):
-                    cur = next(
-                        (x for x in existing if x.get("comment") == rule["comment"]),
-                        None,
-                    )
-                    if cur and cur.get("dst-port") != str(listen_port):
-                        await self.mt.update_firewall_rule(
-                            cur[".id"], **{"dst-port": str(listen_port)}
-                        )
-                continue
+        handshake_comment = f"wg-{iface}-handshake"
+        if handshake_comment not in comments:
             await self.mt.add_firewall_rule(
-                rule["comment"],
-                place_before=rule["anchor"],
-                chain=rule["chain"],
-                **rule["fields"],
+                handshake_comment,
+                place_before=input_anchor,
+                chain="input",
+                protocol="udp",
+                dst_port=str(listen_port),
+                action="accept",
             )
-
-        nat_existing = await self.mt.get_firewall_nat_rules()
-        nat_comments = {r.get("comment") for r in nat_existing}
-        if not self._has_consolidated_nat(nat_existing):
-            nat_rule = {
-                "comment": f"wg-{iface}-nat",
-                "chain": "srcnat",
-                "src-address": subnet,
-                "action": "masquerade",
-            }
-            if nat_rule["comment"] not in nat_comments:
-                fields = {k: v for k, v in nat_rule.items() if k != "comment"}
-                await self.mt.add_firewall_nat_rule(nat_rule["comment"], **fields)
+        else:
+            cur = next((x for x in existing if x.get("comment") == handshake_comment), None)
+            if cur and cur.get("dst-port") != str(listen_port):
+                await self.mt.update_firewall_rule(
+                    cur[".id"], **{"dst-port": str(listen_port)}
+                )
 
     async def _reposition_user_rules(self, iface: str, listen_port: int) -> None:
-        """Delete and recreate a user's firewall rules in the canonical position.
+        """Delete and recreate a user's per-user rules in the canonical position.
 
-        Used to migrate rules created by older code (which placed them at the
-        very top of the chains). The rules end up just above the first drop
-        rule of the input / forward chain: handshake, input, then forward,
-        return.
+        Used to migrate rules created by older code. In the consolidated scheme
+        only the per-user handshake is recreated; the shared wg-all-* rules and
+        wg-isolate are ensured separately.
         """
         rules = await self.mt.get_firewall_rules()
         input_anchor = self._chain_drop_anchor(rules, "input")
-        forward_anchor = self._chain_drop_anchor(rules, "forward")
         for r in rules:
             if (r.get("comment") or "").startswith(f"wg-{iface}-"):
                 await self.mt.delete_firewall_rule(r[".id"])
+        for nr in await self.mt.get_firewall_nat_rules():
+            if (nr.get("comment") or "").startswith(f"wg-{iface}-"):
+                await self.mt.delete_firewall_nat_rule(nr[".id"])
+        await self._ensure_consolidated_rules()
+        await self._sync_wg_subnets()
         await self._ensure_lan_member(iface)
-        consolidated_forward = self._has_consolidated_forward(
-            rules, _WG_ALL_FORWARD_COMMENT
-        ) and self._has_consolidated_forward(rules, _WG_ALL_RETURN_COMMENT)
-        wanted = [
-            {
-                "comment": f"wg-{iface}-input",
-                "chain": "input",
-                "anchor": input_anchor,
-                "fields": {"in-interface": iface, "action": "accept"},
-            },
-            {
-                "comment": f"wg-{iface}-handshake",
-                "chain": "input",
-                "anchor": input_anchor,
-                "fields": {
-                    "protocol": "udp",
-                    "dst-port": str(listen_port),
-                    "action": "accept",
-                },
-            },
-        ]
-        if not consolidated_forward:
-            wanted += [
-                {
-                    "comment": f"wg-{iface}-return",
-                    "chain": "forward",
-                    "anchor": forward_anchor,
-                    "fields": {
-                        "out-interface": iface,
-                        "connection-state": "established,related",
-                        "action": "accept",
-                    },
-                },
-                {
-                    "comment": f"wg-{iface}-forward",
-                    "chain": "forward",
-                    "anchor": forward_anchor,
-                    "fields": {"in-interface": iface, "action": "accept"},
-                },
-            ]
-        for rule in wanted:
+        rules = await self.mt.get_firewall_rules()
+        input_anchor = self._chain_drop_anchor(rules, "input")
+        handshake_comment = f"wg-{iface}-handshake"
+        if not any(r.get("comment") == handshake_comment for r in rules):
             await self.mt.add_firewall_rule(
-                rule["comment"],
-                place_before=rule["anchor"],
-                chain=rule["chain"],
-                **rule["fields"],
+                handshake_comment,
+                place_before=input_anchor,
+                chain="input",
+                protocol="udp",
+                dst_port=str(listen_port),
+                action="accept",
             )
 
     def _next_peer_ip(self, subnet: str, used: set[str]) -> str | None:
@@ -3310,14 +3281,18 @@ def build_app(cfg: Config) -> tuple[Application, Bot]:
         await _setup_ui(application)
         await bot._reconfigure_mt()
         try:
+            await bot._ensure_consolidated_rules()
             await bot._sync_wg_subnets()
-            if db.get_setting("fw_v2") != "1":
+            if db.get_setting("fw_v3") != "1":
+                # Migrate: drop stale per-user forward/return/nat rules and
+                # recreate only the per-user handshake under the consolidated
+                # wg-all-* scheme.
                 for u in db.list_users():
                     if u.get("wg_interface"):
                         await bot._reposition_user_rules(
                             u["wg_interface"], u.get("listen_port") or 0
                         )
-                db.set_setting("fw_v2", "1")
+                db.set_setting("fw_v3", "1")
         except RouterOSError as exc:
             logger.warning("Не удалось синхронизировать правила firewall: %s", exc)
 
