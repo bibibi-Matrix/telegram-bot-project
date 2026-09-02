@@ -3325,7 +3325,7 @@ def build_app(cfg: Config) -> tuple[Application, Bot]:
                 except (asyncio.CancelledError, Exception):  # noqa: BLE001
                     pass
 
-        application.post_shutdown(_stop_background_tasks)
+        application.post_shutdown = _stop_background_tasks
 
         t1 = asyncio.create_task(_expiry_loop())
         t2 = asyncio.create_task(_deadline_warn_loop())
