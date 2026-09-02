@@ -3317,7 +3317,7 @@ def build_app(cfg: Config) -> tuple[Application, Bot]:
 
         background_tasks: set[asyncio.Task] = set()
 
-        async def _stop_background_tasks() -> None:
+        async def _stop_background_tasks(application) -> None:  # noqa: ARG001
             for t in list(background_tasks):
                 t.cancel()
                 try:
