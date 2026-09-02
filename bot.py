@@ -379,7 +379,7 @@ class Bot:
         matching rule when the comment differs (e.g. an older name) but the
         structure matches.
         """
-        return self._find_rule_by_comment(rules, chain, comment) is not None
+        return Bot._find_rule_by_comment(rules, chain, comment) is not None
 
     @staticmethod
     def _has_consolidated_nat(nat_rules: list[dict]) -> bool:
