@@ -3267,6 +3267,9 @@ def build_app(cfg: Config) -> tuple[Application, Bot]:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=cfg.LOG_LEVEL,
     )
+    # http clients log every request at INFO — silence them (spams router logs).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     missing = cfg.validate()
     if missing:
